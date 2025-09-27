@@ -69,14 +69,14 @@ class DreamerV3ActorCriticPolicy(ActorCriticPolicy):
             'vf': [1024,1024,1024],
             'rew': [1024],
             'con': [1024],
-        }
-
+        },
         dreamer_kwargs: Optional[dict[str, Any]] = None,
     ):
         self.sequence_model_size = sequence_model_size
         self.latent_size = latent_length*latent_classes
         self.full_state_size = self.sequence_model_size + self.latent_size
 
+        #TODO
         super().__init__(
             observation_space,
             action_space,
