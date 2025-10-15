@@ -2,6 +2,7 @@ import os
 
 from sb3_contrib.ars import ARS
 from sb3_contrib.crossq import CrossQ
+from sb3_contrib.dreamerV3 import DreamerV3
 from sb3_contrib.ppo_mask import MaskablePPO
 from sb3_contrib.ppo_recurrent import RecurrentPPO
 from sb3_contrib.qrdqn import QRDQN
@@ -21,4 +22,5 @@ __all__ = [
     "CrossQ",
     "MaskablePPO",
     "RecurrentPPO",
+    "DreamerV3",
 ]
