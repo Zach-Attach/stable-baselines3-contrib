@@ -291,7 +291,7 @@ class DreamerV3ActorCriticPolicy(ActorCriticPolicy):
             self.sequence_model_blocks,
         )
 
-        # Build actor network - takes extracted features, not full state
+        # Build actor network - takes extracted features
         self.actor_net = _create_mlp(
             n_flatten,
             action_dim,
