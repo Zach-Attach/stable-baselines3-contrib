@@ -28,13 +28,13 @@ SelfDreamerV3 = TypeVar("SelfDreamerV3", bound="DreamerV3")
 class DreamerV3(BaseAlgorithm):
     """
     DreamerV3: Mastering Diverse Domains through World Models
-    
+
     DreamerV3 is a model-based reinforcement learning algorithm that learns
     a world model to predict future states and rewards, then trains an actor-critic
     policy within the learned model.
-    
+
     Paper: https://arxiv.org/abs/2301.04104
-    
+
     :param policy: The policy model to use (MlpPolicy, CnnPolicy, MultiInputPolicy, ...)
     :param env: The environment to learn from
     :param learning_rate: Learning rate for the optimizer
@@ -69,18 +69,18 @@ class DreamerV3(BaseAlgorithm):
         policy: Union[str, Type[DreamerV3ActorCriticPolicy]],
         env: Union[GymEnv, str],
         learning_rate: Union[float, Schedule] = 1e-4,
-        buffer_size: int = 1_000_000,
-        learning_starts: int = 5000,
-        batch_size: int = 16,
-        batch_length: int = 50,
-        train_freq: Union[int, tuple[int, str]] = 4,
-        gradient_steps: int = 1,
-        imagination_horizon: int = 15,
         model_lr: float = 1e-4,
         actor_lr: float = 3e-5,
         critic_lr: float = 3e-5,
+        buffer_size: int = 1_000_000,
+        batch_size: int = 16,
+        batch_length: int = 50,
         gamma: float = 0.99,
-        lambda_gae: float = 0.95,
+        gae_lambda: float = 0.95,
+        learning_starts: int = 5000,
+        train_freq: Union[int, tuple[int, str]] = 4,
+        gradient_steps: int = 1,
+        imagination_horizon: int = 15,
         target_update_interval: int = 100,
         stats_window_size: int = 100,
         tensorboard_log: Optional[str] = None,
@@ -119,15 +119,15 @@ class DreamerV3(BaseAlgorithm):
         self.actor_lr = actor_lr
         self.critic_lr = critic_lr
         self.gamma = gamma
-        self.lambda_gae = lambda_gae
+        self.gae_lambda = gae_lambda
         self.target_update_interval = target_update_interval
         self.stats_window_size = stats_window_size
-        
+
         self.replay_buffer = None
         self.model_optimizer = None
         self.actor_optimizer = None
         self.critic_optimizer = None
-        
+
         if _init_setup_model:
             self._setup_model()
 
@@ -168,7 +168,7 @@ class DreamerV3(BaseAlgorithm):
             ValueNormalizer,
             SlowValueNetwork,
         )
-        
+
         # Create RSSM (world model)
         self.rssm = RSSM(
             action_space=self.action_space,
@@ -178,61 +178,50 @@ class DreamerV3(BaseAlgorithm):
             hidden_dim=2048,
             num_blocks=8,
         ).to(self.device)
-        
+
         # Create Encoder
         self.encoder = Encoder(
             observation_space=self.observation_space,
             hidden_dim=1024,
             num_layers=3,
         ).to(self.device)
-        
+
         # Create Decoder
         # Feature dim = deter_dim + stoch_dim * num_classes
-        feature_dim = 4096 + 32 * 32
+        feature_dim = 4096 + 32 * 32  # TODO: Parameterize
         self.decoder = Decoder(
             observation_space=self.observation_space,
             feature_dim=feature_dim,
             hidden_dim=1024,
             num_layers=3,
         ).to(self.device)
-        
+
         # Create normalizers
         self.value_normalizer = ValueNormalizer().to(self.device)
         self.return_normalizer = ValueNormalizer().to(self.device)
         self.advantage_normalizer = ValueNormalizer().to(self.device)
-        
+
         # Create slow value network (if policy has critic_net)
-        if hasattr(self.policy, 'critic_net'):
-            self.slow_value = SlowValueNetwork(
-                self.policy.critic_net,
-                tau=0.98
-            ).to(self.device)
-        
+        if hasattr(self.policy, "critic_net"):
+            self.slow_value = SlowValueNetwork(self.policy.critic_net, tau=0.98).to(self.device)
+
         # Setup optimizers with all world model components
-        world_model_params = list(self.rssm.parameters()) + \
-                            list(self.encoder.parameters()) + \
-                            list(self.decoder.parameters())
-        
-        if hasattr(self.policy, 'reward_net'):
+        world_model_params = list(self.rssm.parameters()) + list(self.encoder.parameters()) + list(self.decoder.parameters())
+
+        if hasattr(self.policy, "reward_net"):
             world_model_params.extend(self.policy.reward_net.parameters())
-        if hasattr(self.policy, 'continue_net'):
+        if hasattr(self.policy, "continue_net"):
             world_model_params.extend(self.policy.continue_net.parameters())
-        
+
         self.model_optimizer = th.optim.Adam(world_model_params, lr=self.model_lr)
-        
+
         # Actor optimizer
-        if hasattr(self.policy, 'actor_net'):
-            self.actor_optimizer = th.optim.Adam(
-                self.policy.actor_net.parameters(),
-                lr=self.actor_lr
-            )
-        
+        if hasattr(self.policy, "actor_net"):
+            self.actor_optimizer = th.optim.Adam(self.policy.actor_net.parameters(), lr=self.actor_lr)
+
         # Critic optimizer
-        if hasattr(self.policy, 'critic_net'):
-            self.critic_optimizer = th.optim.Adam(
-                self.policy.critic_net.parameters(),
-                lr=self.critic_lr
-            )
+        if hasattr(self.policy, "critic_net"):
+            self.critic_optimizer = th.optim.Adam(self.policy.critic_net.parameters(), lr=self.critic_lr)
 
     def _sample_action(
         self,
@@ -242,7 +231,7 @@ class DreamerV3(BaseAlgorithm):
     ) -> tuple[np.ndarray, np.ndarray]:
         """
         Sample an action according to the policy.
-        
+
         :param learning_starts: Number of steps before learning starts
         :param action_noise: Action noise
         :param n_envs: Number of environments
@@ -269,11 +258,11 @@ class DreamerV3(BaseAlgorithm):
     def train(self, gradient_steps: int, batch_size: int = 16) -> None:
         """
         Train the DreamerV3 agent.
-        
+
         Training consists of two phases:
         1. World model training: Learn to predict observations, rewards, and episode ends
         2. Actor-critic training: Learn policy and value function in imagination
-        
+
         :param gradient_steps: Number of gradient steps
         :param batch_size: Number of sequences to sample
         """
@@ -295,7 +284,7 @@ class DreamerV3(BaseAlgorithm):
         )
 
         # Initialize components if not already done
-        if not hasattr(self, 'rssm'):
+        if not hasattr(self, "rssm"):
             self._setup_dreamerv3_components()
 
         losses = {
@@ -314,22 +303,22 @@ class DreamerV3(BaseAlgorithm):
             # For now, we'll use the standard replay buffer
             # In a full implementation, this should be a sequence buffer
             replay_data = self.replay_buffer.sample(batch_size)
-            
-            #=================================================================
+
+            # =================================================================
             # PHASE 1: WORLD MODEL TRAINING
-            #=================================================================
-            
+            # =================================================================
+
             # Prepare data
             observations = replay_data.observations
             actions = replay_data.actions
             rewards = replay_data.rewards
             dones = replay_data.dones
-            
+
             # For simplicity, treat each sample as a sequence of length 1
             # In full implementation, we'd have proper sequences
             B = batch_size
             T = 1
-            
+
             # Reshape to (B, T, ...)
             if len(observations.shape) == 2:
                 observations = observations.unsqueeze(1)  # (B, 1, obs_dim)
@@ -338,82 +327,73 @@ class DreamerV3(BaseAlgorithm):
             actions = actions.unsqueeze(1)  # (B, 1, action_dim)
             rewards = rewards.unsqueeze(1)  # (B, 1, 1)
             dones = dones.unsqueeze(1)  # (B, 1, 1)
-            
+
             # Encode observations to tokens
             tokens = self.encoder(observations.squeeze(1))  # (B, token_dim)
             tokens = tokens.unsqueeze(1)  # (B, 1, token_dim)
-            
+
             # Initialize or get RSSM state
-            if not hasattr(self, '_rssm_state'):
+            if not hasattr(self, "_rssm_state"):
                 self._rssm_state = self.rssm.initial(B, self.device)
-            
+
             # RSSM observe step (posterior path)
             resets = dones.squeeze(-1)  # (B, 1)
-            carry, entries, features = self.rssm.observe(
-                self._rssm_state,
-                tokens,
-                actions,
-                resets,
-                training=True
-            )
-            
+            carry, entries, features = self.rssm.observe(self._rssm_state, tokens, actions, resets, training=True)
+
             # Get features (deter + stoch)
-            deter = features['deter']  # (B, T, deter_dim)
-            stoch = features['stoch']  # (B, T, stoch_dim, num_classes)
+            deter = features["deter"]  # (B, T, deter_dim)
+            stoch = features["stoch"]  # (B, T, stoch_dim, num_classes)
             feat = self.rssm.get_feat(deter.squeeze(1), stoch.squeeze(1))  # (B, feat_dim)
-            
+
             # Decode observations
             recon_obs = self.decoder(feat)
-            
+
             # Compute reconstruction loss
             target_obs = observations.squeeze(1)
             rec_loss = self.decoder.reconstruction_loss(recon_obs, target_obs)
-            
+
             # Predict rewards and continues
             reward_pred = self.policy.reward_net(feat)
             continue_pred = self.policy.continue_net(feat)
-            
+
             # Compute reward loss (MSE for simplicity)
             target_rewards = rewards.squeeze(1).squeeze(-1)  # (B,)
             rew_loss = F.mse_loss(reward_pred.squeeze(), target_rewards)
-            
+
             # Compute continue loss (BCE)
             target_continues = (1 - dones.squeeze(1).squeeze(-1)).float()  # (B,)
-            con_loss = F.binary_cross_entropy_with_logits(
-                continue_pred.squeeze(), target_continues
-            )
-            
+            con_loss = F.binary_cross_entropy_with_logits(continue_pred.squeeze(), target_continues)
+
             # Compute KL losses
-            posterior_logits = features['logits']  # (B, T, stoch_dim, num_classes)
+            posterior_logits = features["logits"]  # (B, T, stoch_dim, num_classes)
             prior_logits = self.rssm._prior(deter)  # (B, T, stoch_dim, num_classes)
             dyn_loss, rep_loss = self.rssm.kl_loss(posterior_logits, prior_logits)
-            
+
             # Total world model loss (with loss scales from DreamerV3)
             world_model_loss = (
-                0.5 * dyn_loss +  # Dynamics KL
-                0.1 * rep_loss +  # Representation KL
-                1.0 * rec_loss +  # Reconstruction
-                1.0 * rew_loss +  # Reward prediction
-                1.0 * con_loss    # Continue prediction
+                0.5 * dyn_loss  # Dynamics KL
+                + 0.1 * rep_loss  # Representation KL
+                + 1.0 * rec_loss  # Reconstruction
+                + 1.0 * rew_loss  # Reward prediction
+                + 1.0 * con_loss  # Continue prediction
             )
-            
+
             # Update world model
             self.model_optimizer.zero_grad()
             world_model_loss.backward()
             # Gradient clipping (optional but recommended)
             th.nn.utils.clip_grad_norm_(
-                [p for group in self.model_optimizer.param_groups for p in group['params']],
-                max_norm=100.0
+                [p for group in self.model_optimizer.param_groups for p in group["params"]], max_norm=100.0
             )
             self.model_optimizer.step()
-            
-            #=================================================================
+
+            # =================================================================
             # PHASE 2: ACTOR-CRITIC TRAINING (IN IMAGINATION)
-            #=================================================================
-            
+            # =================================================================
+
             # Start from current states (detach from world model graph)
             imag_carry = {k: v.detach() for k, v in carry.items()}
-            
+
             # Define a simple policy function for imagination
             # In practice, this should use the actual actor network
             def policy_fn(feat):
@@ -429,30 +409,27 @@ class DreamerV3(BaseAlgorithm):
                         # Continuous action
                         action_mean = self.policy.actor_net(feat)
                         return action_mean  # Simplified
-            
+
             # Imagine trajectories
             _, imag_features, imag_actions = self.rssm.imagine(
-                imag_carry,
-                lambda f: policy_fn(f),
-                horizon=self.imagination_horizon,
-                training=False
+                imag_carry, lambda f: policy_fn(f), horizon=self.imagination_horizon, training=False
             )
-            
+
             # Get imagined features
-            imag_deter = imag_features['deter']  # (B, H, deter_dim)
-            imag_stoch = imag_features['stoch']  # (B, H, stoch_dim, num_classes)
+            imag_deter = imag_features["deter"]  # (B, H, deter_dim)
+            imag_stoch = imag_features["stoch"]  # (B, H, stoch_dim, num_classes)
             B, H, _ = imag_deter.shape
-            
+
             # Reshape for network input
             imag_deter_flat = imag_deter.reshape(B * H, -1)
             imag_stoch_flat = imag_stoch.reshape(B * H, -1)
             imag_feat = th.cat([imag_deter_flat, imag_stoch_flat], dim=-1)
-            
+
             # Predict rewards and values in imagination
             imag_rewards = self.policy.reward_net(imag_feat).reshape(B, H)
             imag_continues = th.sigmoid(self.policy.continue_net(imag_feat).reshape(B, H))
             imag_values = self.policy.critic_net(imag_feat).reshape(B, H)
-            
+
             # Compute lambda returns (simplified version)
             # In full implementation, use the proper lambda_return function
             bootstrap = imag_values[:, -1]  # Use last value as bootstrap
@@ -462,29 +439,29 @@ class DreamerV3(BaseAlgorithm):
                 G = imag_rewards[:, t] + self.gamma * imag_continues[:, t] * G
                 returns.insert(0, G)
             returns = th.stack(returns, dim=1)
-            
+
             # Compute advantages
             advantages = returns.detach() - imag_values
-            
+
             # Actor loss (simplified)
             # In full implementation, use actual log probs
             actor_loss_val = -advantages.mean()  # Simplified
-            
+
             # Critic loss
             critic_loss_val = F.mse_loss(imag_values, returns.detach())
-            
+
             # Update actor
-            if hasattr(self, 'actor_optimizer'):
+            if hasattr(self, "actor_optimizer"):
                 self.actor_optimizer.zero_grad()
                 actor_loss_val.backward(retain_graph=True)
                 self.actor_optimizer.step()
-            
-            # Update critic  
-            if hasattr(self, 'critic_optimizer'):
+
+            # Update critic
+            if hasattr(self, "critic_optimizer"):
                 self.critic_optimizer.zero_grad()
                 critic_loss_val.backward()
                 self.critic_optimizer.step()
-            
+
             # Store losses
             losses["world_model"].append(world_model_loss.item())
             losses["dyn_loss"].append(dyn_loss.item())
@@ -518,7 +495,7 @@ class DreamerV3(BaseAlgorithm):
     ) -> SelfDreamerV3:
         """
         Learn according to the DreamerV3 algorithm.
-        
+
         :param total_timesteps: Total number of samples to train on
         :param callback: Callback(s) called at every step
         :param log_interval: Log info every n steps
@@ -539,7 +516,7 @@ class DreamerV3(BaseAlgorithm):
     def _excluded_save_params(self) -> list[str]:
         """
         Returns list of parameters that should not be saved.
-        
+
         :return: List of parameter names
         """
         return super()._excluded_save_params() + ["replay_buffer"]
@@ -547,9 +524,9 @@ class DreamerV3(BaseAlgorithm):
     def _get_torch_save_params(self) -> tuple[list[str], list[str]]:
         """
         Get parameters to save for TorchSave.
-        
+
         :return: State dicts to save and optimizer state dicts
         """
         state_dicts = ["policy"]
-        
+
         return state_dicts, []

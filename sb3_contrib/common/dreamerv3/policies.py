@@ -1,4 +1,5 @@
 """Policy classes for DreamerV3 implementation."""
+
 import math
 from collections import OrderedDict
 from typing import Any, Optional, Union
@@ -33,15 +34,15 @@ from sb3_contrib.common.recurrent.type_aliases import RNNStates
 
 
 def _create_mlp(
-    input_size: int, 
-    output_size: int, 
+    input_size: int,
+    output_size: int,
     net_arch: list[int],
     activation_fn: type[nn.Module] = nn.SiLU,
     use_rms_norm: bool = True,
 ) -> nn.Sequential:
     """
     Create a multi-layer perceptron (MLP) network.
-    
+
     :param input_size: Input dimension
     :param output_size: Output dimension
     :param net_arch: Architecture of the network (list of layer sizes)
@@ -51,34 +52,35 @@ def _create_mlp(
     """
     if len(net_arch) == 0:
         return nn.Sequential(nn.Linear(input_size, output_size))
-    
+
     layers = []
     current_size = input_size
-    
+
     for i, hidden_size in enumerate(net_arch):
         layers.append(nn.Linear(current_size, hidden_size))
         if use_rms_norm:
             layers.append(nn.RMSNorm(hidden_size))
         layers.append(activation_fn())
         current_size = hidden_size
-    
+
     layers.append(nn.Linear(current_size, output_size))
-    
+
     return nn.Sequential(*layers)
 
 
 class BlockDiagonalGRU(nn.Module):
     """
     A GRU with block-diagonal recurrent weights.
-    
+
     This module breaks the hidden state into `num_blocks` chunks and applies
     separate linear transformations to each, creating a block-diagonal structure.
     This reduces parameters and computation compared to standard GRU.
-    
+
     :param input_size: Size of input features
     :param hidden_size: Size of hidden state
     :param num_blocks: Number of diagonal blocks (default: 8 for DreamerV3)
     """
+
     def __init__(self, input_size: int, hidden_size: int, num_blocks: int = 8):
         super().__init__()
 
@@ -88,18 +90,15 @@ class BlockDiagonalGRU(nn.Module):
 
         if hidden_size % num_blocks != 0:
             raise ValueError("hidden_size must be divisible by num_blocks")
-        
+
         self.block_size = hidden_size // num_blocks
 
         # Input-to-hidden weights (dense) for all 3 gates
         self.W_i = nn.Linear(input_size, 3 * hidden_size)
 
         # Hidden-to-hidden weights (block-diagonal) for all 3 gates
-        self.W_h = nn.ModuleList([
-            nn.Linear(self.block_size, 3 * self.block_size, bias=False)
-            for _ in range(num_blocks)
-        ])
-        
+        self.W_h = nn.ModuleList([nn.Linear(self.block_size, 3 * self.block_size, bias=False) for _ in range(num_blocks)])
+
         # Hidden-to-hidden bias
         self.b_h = nn.Parameter(torch.zeros(3 * hidden_size))
 
@@ -111,14 +110,10 @@ class BlockDiagonalGRU(nn.Module):
         for weight in self.parameters():
             nn.init.uniform_(weight, -stdv, stdv)
 
-    def forward(
-        self, 
-        x: torch.Tensor, 
-        h_0: Optional[torch.Tensor] = None
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, x: torch.Tensor, h_0: Optional[torch.Tensor] = None) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Process input sequence through block-diagonal GRU.
-        
+
         :param x: Input tensor of shape (seq_len, batch_size, input_size)
         :param h_0: Initial hidden state of shape (batch_size, hidden_size) or (1, batch_size, hidden_size)
         :return: Output sequence and final hidden state
@@ -137,7 +132,7 @@ class BlockDiagonalGRU(nn.Module):
 
         # Precompute input transformations
         x_gates = self.W_i(x)
-        
+
         outputs = []
 
         for t in range(seq_len):
@@ -148,40 +143,39 @@ class BlockDiagonalGRU(nn.Module):
 
             # Combine input and hidden transformations
             gates = x_gates[t] + h_gates
-            
+
             # Split into reset, update, and new gates
             r_gate_raw, z_gate_raw, n_gate_raw = gates.chunk(3, dim=1)
 
             # Apply activations
             r_t = torch.sigmoid(r_gate_raw)
             z_t = torch.sigmoid(z_gate_raw)
-            
+
             # Compute new gate with reset applied to hidden state
             h_r_gate, h_z_gate, h_n_gate = h_gates.chunk(3, dim=1)
             x_r_gate, x_z_gate, x_n_gate = x_gates[t].chunk(3, dim=1)
             n_t = torch.tanh(x_n_gate + r_t * h_n_gate)
-            
+
             # Update hidden state
             h_t = (1 - z_t) * n_t + z_t * h_t
-            
+
             outputs.append(h_t)
 
         output = torch.stack(outputs, dim=0)
         return output, h_t
 
 
-
 class DreamerV3ActorCriticPolicy(ActorCriticPolicy):
     """
     Actor-Critic policy for DreamerV3 implementation.
-    
+
     This policy implements the DreamerV3 architecture with:
     - World model with sequence (GRU) and dynamics models
     - Actor network for action prediction
     - Critic network for value prediction
     - Reward predictor
     - Continue predictor (episode termination)
-    
+
     :param observation_space: Observation space
     :param action_space: Action space
     :param lr_schedule: Learning rate schedule
@@ -326,7 +320,7 @@ class DreamerV3ActorCriticPolicy(ActorCriticPolicy):
     def _get_action_dist_from_latent(self, latent_pi: th.Tensor) -> Distribution:
         """
         Get the action distribution from the latent policy representation.
-        
+
         :param latent_pi: Latent representation from which to generate actions
         :return: Action distribution
         """
@@ -334,27 +328,27 @@ class DreamerV3ActorCriticPolicy(ActorCriticPolicy):
             # Continuous actions - use BoundedDiagGaussianDistribution
             mean_actions, log_std = self.action_net(latent_pi)
             return self.action_dist.proba_distribution(mean_actions, log_std)
-        
+
         elif isinstance(self.action_space, spaces.Discrete):
             # Discrete actions - use CategoricalDistribution with unimix
             action_logits = self.actor_net(latent_pi)
-            
+
             # Apply uniform mixing (unimix) if configured
             if self.unimix > 0.0:
                 probs = th.softmax(action_logits, dim=-1)
                 uniform = th.ones_like(probs) / probs.shape[-1]
                 probs = (1 - self.unimix) * probs + self.unimix * uniform
                 action_logits = th.log(probs + 1e-8)  # Add epsilon for numerical stability
-            
+
             return self.action_dist.proba_distribution(action_logits)
-        
+
         else:
             raise NotImplementedError(f"Action space {self.action_space} not supported")
 
     def _build(self, lr_schedule: Schedule) -> None:
         """
         Build the policy networks and distributions.
-        
+
         :param lr_schedule: Learning rate schedule
         """
         self._build_mlp_extractor()
@@ -368,18 +362,19 @@ class DreamerV3ActorCriticPolicy(ActorCriticPolicy):
         if isinstance(self.action_space, spaces.Box):
             action_dim = get_action_dim(self.action_space)
             self.action_dist = BoundedDiagGaussianDistribution(action_dim)
+
             # Action net outputs both mean and std
             class ActionNet(nn.Module):
                 def __init__(self, actor_net: nn.Module):
                     super().__init__()
                     self.actor_net = actor_net
-                
+
                 def forward(self, x: th.Tensor) -> tuple[th.Tensor, th.Tensor]:
                     # Split output into mean and std
                     out = self.actor_net(x)
                     mid = out.shape[-1] // 2
                     return out[..., :mid], out[..., mid:]
-            
+
             # Modify actor_net to output 2*action_dim for mean and std
             self.actor_net = _create_mlp(
                 n_flatten,
@@ -388,7 +383,7 @@ class DreamerV3ActorCriticPolicy(ActorCriticPolicy):
                 self.activation_fn,
             )
             self.action_net = ActionNet(self.actor_net)
-            
+
         elif isinstance(self.action_space, spaces.Discrete):
             self.action_dist = CategoricalDistribution(self.action_space.n)
         else:
@@ -396,41 +391,37 @@ class DreamerV3ActorCriticPolicy(ActorCriticPolicy):
 
         # Build optimizer
         if self.optimizer_class is not None:
-            self.optimizer = self.optimizer_class(
-                self.parameters(), 
-                lr=lr_schedule(1), 
-                **self.optimizer_kwargs
-            )
-    
+            self.optimizer = self.optimizer_class(self.parameters(), lr=lr_schedule(1), **self.optimizer_kwargs)
+
     def forward(self, obs: th.Tensor, deterministic: bool = False) -> tuple[th.Tensor, th.Tensor, th.Tensor]:
         """
         Forward pass in all networks (actor and critic).
-        
+
         :param obs: Observation
         :param deterministic: Whether to sample or use deterministic actions
         :return: action, value and log probability of the action
         """
         # Extract features from observation
         features = self.extract_features(obs, self.pi_features_extractor)
-        
+
         # For now, use features directly as latent representation
         # In full DreamerV3, this would go through the world model
         latent_pi = features
-        
+
         # Get action distribution and sample/predict
         distribution = self._get_action_dist_from_latent(latent_pi)
         actions = distribution.get_actions(deterministic=deterministic)
         log_prob = distribution.log_prob(actions)
-        
+
         # Get value from critic
         values = self.predict_values(obs)
-        
+
         return actions, values, log_prob
-    
+
     def _predict(self, observation: th.Tensor, deterministic: bool = False) -> th.Tensor:
         """
         Get the action according to the policy for a given observation.
-        
+
         :param observation: Observation
         :param deterministic: Whether to use stochastic or deterministic actions
         :return: Taken action according to the policy
@@ -438,33 +429,33 @@ class DreamerV3ActorCriticPolicy(ActorCriticPolicy):
         # Extract features
         features = self.extract_features(observation, self.pi_features_extractor)
         latent_pi = features
-        
+
         # Get distribution and sample
         distribution = self._get_action_dist_from_latent(latent_pi)
         return distribution.get_actions(deterministic=deterministic)
-    
+
     def predict_values(self, obs: th.Tensor) -> th.Tensor:
         """
         Get the estimated values according to the current policy given the observations.
-        
+
         :param obs: Observation
         :return: The estimated values
         """
         # Extract features
         features = self.extract_features(obs, self.vf_features_extractor)
         latent_vf = features
-        
+
         # Use SymexpTwoHotDistribution for value prediction
         value_logits = self.critic_net(latent_vf)
         self.critic_dist.proba_distribution(value_logits)
         values = self.critic_dist.mode()
-        
+
         return values
-    
+
     def evaluate_actions(self, obs: th.Tensor, actions: th.Tensor) -> tuple[th.Tensor, th.Tensor, Optional[th.Tensor]]:
         """
         Evaluate actions according to the current policy.
-        
+
         :param obs: Observation
         :param actions: Actions
         :return: estimated value, log likelihood of taking those actions, and entropy
@@ -472,29 +463,29 @@ class DreamerV3ActorCriticPolicy(ActorCriticPolicy):
         # Extract features
         features = self.extract_features(obs, self.pi_features_extractor)
         latent_pi = features
-        
+
         # Get distribution
         distribution = self._get_action_dist_from_latent(latent_pi)
         log_prob = distribution.log_prob(actions)
         entropy = distribution.entropy()
-        
+
         # Get values
         values = self.predict_values(obs)
-        
+
         return values, log_prob, entropy
 
 
 class DreamerV3CnnPolicy(DreamerV3ActorCriticPolicy):
     """
     DreamerV3 policy with CNN feature extractor.
-    
+
     :param observation_space: Observation space
     :param action_space: Action space
     :param lr_schedule: Learning rate schedule
     :param net_arch: Network architecture specification
     :param activation_fn: Activation function
     """
-    
+
     def __init__(
         self,
         observation_space: spaces.Space,
@@ -502,6 +493,8 @@ class DreamerV3CnnPolicy(DreamerV3ActorCriticPolicy):
         lr_schedule: Schedule,
         net_arch: Optional[Union[list[int], dict[str, list[int]]]] = None,
         activation_fn: type[nn.Module] = nn.SiLU,
+        features_extractor_class: type[BaseFeaturesExtractor] = NatureCNN,
+        features_extractor_kwargs: Optional[dict[str, Any]] = None,
         **kwargs: Any,
     ):
         super().__init__(
@@ -510,7 +503,8 @@ class DreamerV3CnnPolicy(DreamerV3ActorCriticPolicy):
             lr_schedule,
             net_arch,
             activation_fn,
-            features_extractor_class=NatureCNN,
+            features_extractor_class,
+            features_extractor_kwargs,
             **kwargs,
         )
 
@@ -518,14 +512,14 @@ class DreamerV3CnnPolicy(DreamerV3ActorCriticPolicy):
 class DreamerV3MultiInputPolicy(DreamerV3ActorCriticPolicy):
     """
     DreamerV3 policy with multi-input feature extractor.
-    
+
     :param observation_space: Observation space (dict space)
     :param action_space: Action space
     :param lr_schedule: Learning rate schedule
     :param net_arch: Network architecture specification
     :param activation_fn: Activation function
     """
-    
+
     def __init__(
         self,
         observation_space: spaces.Space,
