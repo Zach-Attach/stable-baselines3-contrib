@@ -174,6 +174,58 @@ class DreamerV3(OffPolicyAlgorithm):
         self.actor_optimizer = None
         self.critic_optimizer = None
 
+    def _reinit_actor_critic(self) -> None:
+        """Reinitialize actor and critic networks after NaN corruption."""
+        from sb3_contrib.common.dreamerv3.distributions import SymexpTwoHotDistribution, BoundedDiagGaussianDistribution
+        from stable_baselines3.common.distributions import CategoricalDistribution
+        
+        rssm_feature_dim = 4096 + 32 * 32  # 5120
+        
+        # Helper to create MLP
+        def create_mlp(input_dim: int, output_dim: int, hidden_dim: int = 1024, num_layers: int = 3):
+            """Create simple MLP without normalization for stability."""
+            layers = [
+                nn.Linear(input_dim, hidden_dim),
+                nn.SiLU(),
+            ]
+            for _ in range(num_layers - 2):
+                layers.extend([
+                    nn.Linear(hidden_dim, hidden_dim),
+                    nn.SiLU(),
+                ])
+            layers.append(nn.Linear(hidden_dim, output_dim))
+            return nn.Sequential(*layers)
+        
+        # Recreate actor network
+        if isinstance(self.action_space, spaces.Box):
+            action_dim = self.action_space.shape[0]
+            self.world_model_actor_dist = BoundedDiagGaussianDistribution(action_dim)
+            self.world_model_actor_net = create_mlp(rssm_feature_dim, 2 * action_dim).to(self.device)
+        elif isinstance(self.action_space, spaces.Discrete):
+            action_dim = self.action_space.n
+            self.world_model_actor_dist = CategoricalDistribution(action_dim)
+            self.world_model_actor_net = create_mlp(rssm_feature_dim, action_dim).to(self.device)
+        
+        # Initialize actor network weights
+        for module in self.world_model_actor_net.modules():
+            if isinstance(module, nn.Linear):
+                nn.init.xavier_uniform_(module.weight, gain=0.01)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+        
+        # Recreate critic network
+        self.world_model_critic_dist = SymexpTwoHotDistribution(action_dim=1, bins=255).to(self.device)
+        self.world_model_critic_net = self.world_model_critic_dist.proba_distribution_net(rssm_feature_dim).to(self.device)
+        
+        # Recreate slow critic network
+        self.slow_critic_dist = SymexpTwoHotDistribution(action_dim=1, bins=255).to(self.device)
+        self.slow_critic_net = self.slow_critic_dist.proba_distribution_net(rssm_feature_dim).to(self.device)
+        self.slow_critic_net.load_state_dict(self.world_model_critic_net.state_dict())
+        
+        # Recreate optimizers
+        self.actor_optimizer = th.optim.Adam(self.world_model_actor_net.parameters(), lr=self.actor_lr)
+        self.critic_optimizer = th.optim.Adam(self.world_model_critic_net.parameters(), lr=self.critic_lr)
+
     def _setup_dreamerv3_components(self) -> None:
         """Setup DreamerV3-specific components (RSSM, Encoder, Decoder, etc.)."""
         from sb3_contrib.common.dreamerv3 import (
@@ -183,8 +235,8 @@ class DreamerV3(OffPolicyAlgorithm):
             ValueNormalizer,
             SlowValueNetwork,
         )
-        from sb3_contrib.common.dreamerv3.distributions import SymexpTwoHotDistribution
-        from stable_baselines3.common.distributions import BernoulliDistribution
+        from sb3_contrib.common.dreamerv3.distributions import SymexpTwoHotDistribution, BoundedDiagGaussianDistribution
+        from stable_baselines3.common.distributions import BernoulliDistribution, CategoricalDistribution
 
         # Create RSSM (world model)
         self.rssm = RSSM(
@@ -223,14 +275,60 @@ class DreamerV3(OffPolicyAlgorithm):
         self.world_model_continue_dist = BernoulliDistribution(1)
         self.world_model_continue_net = self.world_model_continue_dist.proba_distribution_net(rssm_feature_dim).to(self.device)
 
+        # Create world model actor and critic networks (for imagination training)
+        # These take RSSM features as input and are used during imagination rollouts
+        
+        # Helper to create MLP
+        def create_mlp(input_dim: int, output_dim: int, hidden_dim: int = 1024, num_layers: int = 3):
+            """Create simple MLP without normalization for stability."""
+            layers = [
+                nn.Linear(input_dim, hidden_dim),
+                nn.SiLU(),
+            ]
+            for _ in range(num_layers - 2):
+                layers.extend([
+                    nn.Linear(hidden_dim, hidden_dim),
+                    nn.SiLU(),
+                ])
+            layers.append(nn.Linear(hidden_dim, output_dim))
+            return nn.Sequential(*layers)
+        
+        # Actor network
+        if isinstance(self.action_space, spaces.Box):
+            # Continuous actions
+            action_dim = self.action_space.shape[0]
+            self.world_model_actor_dist = BoundedDiagGaussianDistribution(action_dim)
+            self.world_model_actor_net = create_mlp(rssm_feature_dim, 2 * action_dim).to(self.device)
+        elif isinstance(self.action_space, spaces.Discrete):
+            # Discrete actions
+            action_dim = self.action_space.n
+            self.world_model_actor_dist = CategoricalDistribution(action_dim)
+            self.world_model_actor_net = create_mlp(rssm_feature_dim, action_dim).to(self.device)
+        else:
+            raise NotImplementedError(f"Action space {self.action_space} not supported")
+        
+        # Initialize actor network weights with Xavier/Glorot initialization
+        for module in self.world_model_actor_net.modules():
+            if isinstance(module, nn.Linear):
+                nn.init.xavier_uniform_(module.weight, gain=0.01)  # Small gain for stability
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+        
+        # Critic network (value function)
+        self.world_model_critic_dist = SymexpTwoHotDistribution(action_dim=1, bins=255).to(self.device)
+        self.world_model_critic_net = self.world_model_critic_dist.proba_distribution_net(rssm_feature_dim).to(self.device)
+        
+        # Slow critic network for stable targets
+        self.slow_critic_dist = SymexpTwoHotDistribution(action_dim=1, bins=255).to(self.device)
+        self.slow_critic_net = self.slow_critic_dist.proba_distribution_net(rssm_feature_dim).to(self.device)
+        # Initialize slow critic with same weights as critic
+        self.slow_critic_net.load_state_dict(self.world_model_critic_net.state_dict())
+        self.slow_critic_tau = 0.98  # Slow update coefficient
+
         # Create normalizers
         self.value_normalizer = ValueNormalizer().to(self.device)
         self.return_normalizer = ValueNormalizer().to(self.device)
         self.advantage_normalizer = ValueNormalizer().to(self.device)
-
-        # Create slow value network (if policy has critic_net)
-        if hasattr(self.policy, "critic_net"):
-            self.slow_value = SlowValueNetwork(self.policy.critic_net, tau=0.98).to(self.device)
 
         # Setup optimizers with all world model components
         world_model_params = (
@@ -243,13 +341,11 @@ class DreamerV3(OffPolicyAlgorithm):
 
         self.model_optimizer = th.optim.Adam(world_model_params, lr=self.model_lr)
 
-        # Actor optimizer
-        if hasattr(self.policy, "actor_net"):
-            self.actor_optimizer = th.optim.Adam(self.policy.actor_net.parameters(), lr=self.actor_lr)
+        # Actor optimizer (for imagination-trained actor)
+        self.actor_optimizer = th.optim.Adam(self.world_model_actor_net.parameters(), lr=self.actor_lr)
 
-        # Critic optimizer
-        if hasattr(self.policy, "critic_net"):
-            self.critic_optimizer = th.optim.Adam(self.policy.critic_net.parameters(), lr=self.critic_lr)
+        # Critic optimizer (for imagination-trained critic)
+        self.critic_optimizer = th.optim.Adam(self.world_model_critic_net.parameters(), lr=self.critic_lr)
 
     def _sample_action(
         self,
@@ -314,6 +410,10 @@ class DreamerV3(OffPolicyAlgorithm):
         # Initialize components if not already done
         if not hasattr(self, "rssm"):
             self._setup_dreamerv3_components()
+        
+        # Skip imagination training for the first N updates to let world model stabilize
+        imagination_warmup_updates = 50  # Number of world model updates before starting imagination
+        should_skip_imagination = self._n_updates < imagination_warmup_updates
 
         losses = {
             "world_model": [],
@@ -421,22 +521,260 @@ class DreamerV3(OffPolicyAlgorithm):
             # PHASE 2: ACTOR-CRITIC TRAINING (IN IMAGINATION)
             # =================================================================
             
-            # NOTE: Actor-critic training in imagination is currently disabled
-            # because it requires either:
-            # 1. Separate actor/critic networks that accept RSSM features, OR
-            # 2. A proper architecture that maps RSSM features to policy inputs
-            # For now, we only train the world model (Phase 1 above)
+            # Skip imagination during warmup period
+            if should_skip_imagination:
+                actor_loss_val = th.tensor(0.0, device=self.device)
+                critic_loss_val = th.tensor(0.0, device=self.device)
+                losses["actor_loss"].append(actor_loss_val.item())
+                losses["critic_loss"].append(critic_loss_val.item())
+                continue
             
-            # Placeholder losses for actor and critic
-            actor_loss_val = th.tensor(0.0, device=self.device)
-            critic_loss_val = th.tensor(0.0, device=self.device)
+            # Get starting states for imagination (use posterior states from replay)
+            # In the full implementation, we'd select K starting points from the last K timesteps
+            # For simplicity, we'll use the current posterior state
+            start_deter = deter.squeeze(1).detach()  # (B, deter_dim)
+            start_stoch = stoch.squeeze(1).detach()  # (B, stoch_dim, num_classes)
+            start_state = {'deter': start_deter, 'stoch': start_stoch}
             
-            # TODO: Implement proper imagination-based actor-critic training
-            # This would involve:
-            # - Creating world model actor/critic networks that accept RSSM features
-            # - Imagining trajectories using the world model actor
-            # - Computing returns and advantages
-            # - Training the actor and critic on imagined data
+            # Check for NaN in start state or features
+            if th.isnan(start_deter).any() or th.isnan(start_stoch).any():
+                print(f"Warning: NaN in start state - deter NaN: {th.isnan(start_deter).any()}, stoch NaN: {th.isnan(start_stoch).any()}")
+                # Skip imagination training this step
+                actor_loss_val = th.tensor(0.0, device=self.device)
+                critic_loss_val = th.tensor(0.0, device=self.device)
+                losses["actor_loss"].append(actor_loss_val.item())
+                losses["critic_loss"].append(critic_loss_val.item())
+                continue
+            
+            # Check if actor network is producing valid outputs (early training may have numerical issues)
+            test_feat = self.rssm.get_feat(start_deter[:1], start_stoch[:1])
+            test_out = self.world_model_actor_net(th.clamp(test_feat, -10, 10))
+            if th.isnan(test_out).any() or th.isinf(test_out).any():
+                # Check if actor/critic weights are corrupted
+                actor_params_ok = all(not th.isnan(p).any() and not th.isinf(p).any() for p in self.world_model_actor_net.parameters())
+                critic_params_ok = all(not th.isnan(p).any() and not th.isinf(p).any() for p in self.world_model_critic_net.parameters())
+                
+                if not actor_params_ok or not critic_params_ok:
+                    if self.verbose > 0:
+                        print(f"DreamerV3: Reinitializing actor/critic (world model features not stable yet)")
+                    # Reinitialize just the actor and critic networks
+                    self._reinit_actor_critic()
+                
+                actor_loss_val = th.tensor(0.0, device=self.device)
+                critic_loss_val = th.tensor(0.0, device=self.device)
+                losses["actor_loss"].append(actor_loss_val.item())
+                losses["critic_loss"].append(critic_loss_val.item())
+                continue
+            
+            # Define policy function for imagination
+            # This takes RSSM features and returns actions
+            def imagination_policy(feat: th.Tensor) -> th.Tensor:
+                """Policy for imagination rollouts."""
+                # Clip features to prevent overflow
+                feat = th.clamp(feat, -10, 10)
+                
+                # Check for NaN in features
+                if th.isnan(feat).any():
+                    print(f"Warning: NaN in RSSM features! feat shape: {feat.shape}, NaN count: {th.isnan(feat).sum().item()}")
+                    # Use random actions if features are NaN
+                    if isinstance(self.action_space, spaces.Discrete):
+                        action_idx = th.randint(0, self.action_space.n, (feat.shape[0],), device=feat.device)
+                        action = th.nn.functional.one_hot(action_idx.long(), num_classes=self.action_space.n).float()
+                    else:
+                        action = th.randn(feat.shape[0], self.action_space.shape[0], device=feat.device) * 0.1
+                    return action
+                    
+                # Get action distribution from world model actor
+                if isinstance(self.action_space, spaces.Box):
+                    # Continuous actions
+                    actor_out = self.world_model_actor_net(feat)
+                    mean, log_std = th.chunk(actor_out, 2, dim=-1)
+                    self.world_model_actor_dist.proba_distribution(mean, log_std)
+                    action = self.world_model_actor_dist.sample()
+                else:
+                    # Discrete actions
+                    logits = self.world_model_actor_net(feat)
+                    # Clip logits to prevent NaN
+                    logits = th.clamp(logits, -20, 20)
+                    # Check for NaN and clip if needed
+                    if th.isnan(logits).any():
+                        # If we get NaN, use uniform random actions
+                        print(f"Warning: NaN in actor logits after clipping, using uniform random actions")
+                        action_idx = th.randint(0, self.action_space.n, (logits.shape[0],), device=logits.device)
+                    else:
+                        self.world_model_actor_dist.proba_distribution(logits)
+                        action_idx = self.world_model_actor_dist.sample()
+                    # Convert to one-hot for RSSM (expects one-hot for discrete actions)
+                    action = th.nn.functional.one_hot(action_idx.long().squeeze(-1) if action_idx.dim() > 1 else action_idx.long(), num_classes=self.action_space.n).float()
+                return action
+            
+            # Imagine trajectories
+            H = self.imagination_horizon
+            final_state, imag_features, imag_actions = self.rssm.imagine(
+                start_state, 
+                imagination_policy,
+                H,
+                training=True,
+            )
+            
+            # Get imagined features (B, H, feat_dim)
+            imag_deter = imag_features['deter']  # (B, H, deter_dim)
+            imag_stoch = imag_features['stoch']  # (B, H, stoch_dim, num_classes)
+            imag_feat = self.rssm.get_feat(
+                imag_deter.reshape(-1, imag_deter.shape[-1]),
+                imag_stoch.reshape(-1, *imag_stoch.shape[-2:])
+            ).reshape(B, H, -1)  # (B, H, feat_dim)
+            
+            # Predict rewards and continues for imagined states
+            imag_feat_flat = imag_feat.reshape(-1, imag_feat.shape[-1])  # (B*H, feat_dim)
+            imag_reward_logits = self.world_model_reward_net(imag_feat_flat)
+            imag_continue_logits = self.world_model_continue_net(imag_feat_flat)
+            
+            # Get reward predictions
+            self.world_model_reward_dist.proba_distribution(imag_reward_logits)
+            imag_rewards = self.world_model_reward_dist.mode().reshape(B, H, 1)  # (B, H, 1)
+            
+            # Get continue predictions
+            imag_continues = th.sigmoid(imag_continue_logits).reshape(B, H, 1)  # (B, H, 1)
+            
+            # Get value predictions from critic
+            imag_value_logits = self.world_model_critic_net(imag_feat_flat)
+            self.world_model_critic_dist.proba_distribution(imag_value_logits)
+            imag_values = self.world_model_critic_dist.mode().reshape(B, H)  # (B, H)
+            
+            # Get slow value predictions for stable targets
+            with th.no_grad():
+                slow_value_logits = self.slow_critic_net(imag_feat_flat)
+                self.slow_critic_dist.proba_distribution(slow_value_logits)
+                slow_values = self.slow_critic_dist.mode().reshape(B, H)  # (B, H)
+            
+            # Compute bootstrap value (value at H+1, assumed to be last value)
+            bootstrap = slow_values[:, -1]  # (B,)
+            
+            # Compute lambda returns
+            # Squeeze continues to (B, H)
+            continues_for_returns = imag_continues.squeeze(-1)  # (B, H)
+            rewards_for_returns = imag_rewards.squeeze(-1)  # (B, H)
+            
+            # Add bootstrap to values for lambda return computation
+            values_with_bootstrap = th.cat([slow_values, bootstrap.unsqueeze(1)], dim=1)  # (B, H+1)
+            
+            # Compute returns using lambda return
+            from sb3_contrib.common.dreamerv3 import lambda_return
+            returns = lambda_return(
+                rewards=rewards_for_returns,
+                values=values_with_bootstrap,
+                continues=continues_for_returns,
+                bootstrap=bootstrap,
+                lambda_=self.gae_lambda,
+                gamma=self.gamma,
+            )  # (B, H)
+            
+            # Detach returns to prevent gradient flow through slow_values during actor training
+            returns_detached = returns.detach()
+            
+            # Normalize returns for value training
+            returns_normalized = self.return_normalizer.normalize(returns_detached, update=True)
+            
+            # Compute advantages (use detached returns)
+            advantages = returns_detached - slow_values.detach()  # (B, H)
+            
+            # Normalize advantages for policy training
+            advantages_normalized = self.advantage_normalizer.normalize(advantages, update=True)
+            
+            # Compute episode weights (for handling episode boundaries)
+            from sb3_contrib.common.dreamerv3 import compute_episode_weights
+            weights = compute_episode_weights(continues_for_returns.detach(), gamma=self.gamma)  # (B, H)
+            
+            # =================================================================
+            # TRAIN ACTOR (POLICY)
+            # =================================================================
+            
+            # Recompute action distribution for gradient
+            # Use fresh forward pass to avoid shared computational graph with critic
+            if isinstance(self.action_space, spaces.Box):
+                actor_out = self.world_model_actor_net(imag_feat_flat.detach())  # Detach to separate graphs
+                mean, log_std = th.chunk(actor_out, 2, dim=-1)
+                self.world_model_actor_dist.proba_distribution(mean, log_std)
+            else:
+                logits = self.world_model_actor_net(imag_feat_flat.detach())  # Detach to separate graphs
+                # Don't apply unimix in log space - just use raw logits
+                self.world_model_actor_dist.proba_distribution(logits)
+            
+            # Compute log probabilities and entropy
+            imag_actions_flat = imag_actions.reshape(-1, *imag_actions.shape[2:])  # (B*H, action_dim)
+            
+            # For discrete actions, convert one-hot back to indices for log_prob
+            if isinstance(self.action_space, spaces.Discrete):
+                imag_actions_indices = th.argmax(imag_actions_flat, dim=-1)  # (B*H,) - squeeze for CategoricalDistribution
+                log_probs = self.world_model_actor_dist.log_prob(imag_actions_indices).reshape(B, H)  # (B, H)
+            else:
+                log_probs = self.world_model_actor_dist.log_prob(imag_actions_flat).reshape(B, H)  # (B, H)
+            
+            entropy = self.world_model_actor_dist.entropy().reshape(B, H)  # (B, H)
+            
+            # Actor loss: -weight * (log_prob * advantage + entropy_coef * entropy)
+            entropy_coef = 3e-4
+            
+            # Use detached copies of advantages and weights to prevent graph sharing
+            actor_loss_val = compute_actor_loss(
+                log_probs=log_probs,
+                advantages=advantages_normalized.detach(),
+                entropies=entropy,
+                weights=weights.detach(),
+                entropy_coef=entropy_coef,
+            )
+            
+            # Update actor
+            self.actor_optimizer.zero_grad()
+            actor_loss_val.backward()
+            th.nn.utils.clip_grad_norm_(self.world_model_actor_net.parameters(), max_norm=100.0)
+            self.actor_optimizer.step()
+            
+            # Store actor loss value before clearing
+            actor_loss_item = actor_loss_val.item()
+            
+            # Clear any lingering gradients/graphs
+            del actor_loss_val, log_probs, entropy
+            
+            # =================================================================
+            # TRAIN CRITIC (VALUE FUNCTION)
+            # =================================================================
+            
+            # Recompute value predictions for gradient (separate forward pass)
+            imag_value_logits_for_grad = self.world_model_critic_net(imag_feat_flat.detach())  # Detach to separate graphs
+            self.world_model_critic_dist.proba_distribution(imag_value_logits_for_grad)
+            imag_values_for_grad = self.world_model_critic_dist.mode().reshape(B, H)  # (B, H)
+            
+            # Normalize values using return normalizer
+            values_normalized = self.value_normalizer.normalize(imag_values_for_grad, update=True)
+            
+            # Value targets (normalized returns)
+            value_targets = returns_normalized.detach()
+            
+            # Compute value loss with slow regularization
+            from sb3_contrib.common.dreamerv3 import compute_value_loss
+            slow_values_normalized = self.value_normalizer.normalize(slow_values.detach(), update=False)
+            critic_loss_val = compute_value_loss(
+                value_pred=values_normalized,
+                value_target=value_targets,
+                weights=weights.detach(),
+                slow_value_pred=slow_values_normalized.detach(),
+                slow_reg=1.0,
+            )
+            
+            # Update critic
+            self.critic_optimizer.zero_grad()
+            critic_loss_val.backward()
+            th.nn.utils.clip_grad_norm_(self.world_model_critic_net.parameters(), max_norm=100.0)
+            self.critic_optimizer.step()
+            
+            # Update slow critic (EMA update)
+            with th.no_grad():
+                for slow_param, param in zip(self.slow_critic_net.parameters(), self.world_model_critic_net.parameters()):
+                    slow_param.data.copy_(
+                        self.slow_critic_tau * slow_param.data + (1 - self.slow_critic_tau) * param.data
+                    )
 
             # Store losses
             losses["world_model"].append(world_model_loss.item())
@@ -445,7 +783,7 @@ class DreamerV3(OffPolicyAlgorithm):
             losses["rec_loss"].append(rec_loss.item())
             losses["rew_loss"].append(rew_loss.item())
             losses["con_loss"].append(con_loss.item())
-            losses["actor_loss"].append(actor_loss_val.item())
+            losses["actor_loss"].append(actor_loss_item)
             losses["critic_loss"].append(critic_loss_val.item())
 
         # Log training info

@@ -72,9 +72,9 @@ class RunningNormalizer(nn.Module):
                 )
             self.count += 1
         
-        # Use running statistics for normalization
-        mean = self.running_mean
-        std = th.sqrt(self.running_var + self.epsilon)
+        # Use running statistics for normalization (detach to prevent gradient flow)
+        mean = self.running_mean.detach()
+        std = th.sqrt(self.running_var.detach() + self.epsilon)
         
         # Normalize
         normalized = (x - mean) / std

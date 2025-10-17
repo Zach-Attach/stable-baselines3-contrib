@@ -192,10 +192,8 @@ class SymexpTwoHotDistribution(Distribution, nn.Module):
         self.action_dim = action_dim
         self.bins_count = bins
 
-        # Create symmetric bins in symlog space
-        half = torch.linspace(low, high, (self.bins_count - 1) // 2 + 1)
-        half = symexp(half)
-        bins_tensor = torch.cat([half, -torch.flip(half[:-1], dims=[0])], 0)
+        # Create bins linearly spaced in symlog space (do not transform with symexp here)
+        bins_tensor = torch.linspace(low, high, self.bins_count)
 
         self.register_buffer("bins", bins_tensor)
         self.logits = None
