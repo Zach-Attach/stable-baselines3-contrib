@@ -97,12 +97,14 @@ class BoundedDiagGaussianDistribution(Distribution):
         """
         Sample an action from the distribution.
         
-        :return: Sampled action
+        :return: Sampled action (clipped to [-1, 1])
         """
         if self.distribution is None:
             raise RuntimeError("Distribution not initialized. Call proba_distribution first.")
         
-        return self.distribution.rsample()
+        # Sample and clip to [-1, 1] to ensure bounded actions
+        sampled_action = self.distribution.rsample()
+        return torch.clamp(sampled_action, -1.0, 1.0)
 
     def mode(self) -> torch.Tensor:
         """

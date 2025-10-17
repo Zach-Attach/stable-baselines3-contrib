@@ -434,6 +434,51 @@ class DreamerV3ActorCriticPolicy(ActorCriticPolicy):
         distribution = self._get_action_dist_from_latent(latent_pi)
         return distribution.get_actions(deterministic=deterministic)
 
+    def predict(
+        self,
+        observation: Union[np.ndarray, dict[str, np.ndarray]],
+        state: Optional[tuple[np.ndarray, ...]] = None,
+        episode_start: Optional[np.ndarray] = None,
+        deterministic: bool = False,
+    ) -> tuple[np.ndarray, Optional[tuple[np.ndarray, ...]]]:
+        """
+        Get the policy action from an observation (and optional hidden state).
+        
+        Overrides the base class to properly unscale actions for continuous action spaces.
+        DreamerV3 uses tanh-bounded actions (range [-1, 1]) that need to be unscaled
+        to the actual action space bounds.
+
+        :param observation: the input observation
+        :param state: The last hidden states (can be None, used in recurrent policies)
+        :param episode_start: The last masks (can be None, used in recurrent policies)
+        :param deterministic: Whether or not to return deterministic actions.
+        :return: the model's action and the next hidden state
+        """
+        # Switch to eval mode
+        self.set_training_mode(False)
+
+        # Convert observation to tensor
+        obs_tensor, vectorized_env = self.obs_to_tensor(observation)
+
+        with th.no_grad():
+            actions = self._predict(obs_tensor, deterministic=deterministic)
+        
+        # Convert to numpy and reshape
+        actions = actions.cpu().numpy().reshape((-1, *self.action_space.shape))
+
+        # For continuous action spaces, unscale from [-1, 1] to action space bounds
+        # DreamerV3's BoundedDiagGaussianDistribution uses tanh, so actions are in [-1, 1]
+        if isinstance(self.action_space, spaces.Box):
+            # Unscale from [-1, 1] to [low, high]
+            actions = self.unscale_action(actions)
+
+        # Remove batch dimension if needed
+        if not vectorized_env:
+            assert isinstance(actions, np.ndarray)
+            actions = actions.squeeze(axis=0)
+
+        return actions, state
+
     def predict_values(self, obs: th.Tensor) -> th.Tensor:
         """
         Get the estimated values according to the current policy given the observations.
