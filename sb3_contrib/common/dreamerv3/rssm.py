@@ -157,6 +157,17 @@ class RSSM(nn.Module):
         )
         return layer
         
+    def entry_space(self) -> Dict[str, Tuple]:
+        """
+        Return the space specification for RSSM entries (for replay context).
+        
+        :return: Dict with 'deter' and 'stoch' shapes and dtypes
+        """
+        return {
+            'deter': ((self.deter_dim,), th.float32),
+            'stoch': ((self.stoch_dim, self.num_classes), th.float32),
+        }
+    
     def initial(self, batch_size: int, device: th.device) -> Dict[str, th.Tensor]:
         """
         Initialize RSSM state.
@@ -168,6 +179,20 @@ class RSSM(nn.Module):
         deter = th.zeros(batch_size, self.deter_dim, device=device)
         stoch = th.zeros(batch_size, self.stoch_dim, self.num_classes, device=device)
         return {'deter': deter, 'stoch': stoch}
+    
+    def truncate(self, entries: Dict[str, th.Tensor], carry: Optional[Dict[str, th.Tensor]] = None) -> Dict[str, th.Tensor]:
+        """
+        Truncate entries to get carry state for replay context.
+        
+        Takes the last timestep from entries sequence.
+        
+        :param entries: Dict with 'deter' and 'stoch' of shape (batch, time, ...)
+        :param carry: Optional current carry (unused, for API compatibility)
+        :return: Carry state dict with shape (batch, ...)
+        """
+        assert entries['deter'].ndim == 3, f"Expected 3D tensor, got shape {entries['deter'].shape}"
+        # Extract last timestep
+        return {k: v[:, -1] for k, v in entries.items()}
     
     def observe(
         self,
@@ -202,17 +227,44 @@ class RSSM(nn.Module):
         # Process sequence
         for t in range(T):
             # Get current timestep data
-            token_t = tokens[:, t]
-            action_t = actions[:, t]
-            reset_t = resets[:, t].unsqueeze(-1)  # (B, 1)
+            token_t = tokens[:, t]  # (B, token_dim)
+            action_t = actions[:, t]  # (B, action_dim) or (B,) for discrete
+            
+            # Ensure token_t is 2D (defensive check for B=1 case)
+            if token_t.ndim == 1:
+                token_t = token_t.unsqueeze(0)
+            
+            # Ensure action_t is 2D for consistent handling
+            if action_t.ndim == 1:
+                action_t = action_t.unsqueeze(-1)  # (B,) -> (B, 1)
+            
+            reset_t = resets[:, t].unsqueeze(-1).float()  # (B, 1), convert to float for arithmetic
             
             # Reset state if episode boundary
-            deter = deter * (1 - reset_t)
-            stoch = stoch * (1 - reset_t.unsqueeze(-1))
-            action_t = action_t * (1 - reset_t)
+            # Keep the shape explicitly to avoid squeeze issues when B=1
+            # Use keepdim operations to maintain dimensions
+            mask = (1.0 - reset_t)  # (B, 1)
+            deter = deter * mask  # (B, deter_dim) * (B, 1) -> (B, deter_dim)
+            stoch = stoch * mask.unsqueeze(-1)  # (B, stoch_dim, num_classes) * (B, 1, 1)
+            action_t = action_t * mask  # (B, action_dim) * (B, 1)
+            
+            # Ensure deter maintains 2D shape (defensive check)
+            if deter.ndim == 1:
+                deter = deter.unsqueeze(0)
             
             # Update deterministic state
             deter = self._core(deter, stoch, action_t)
+            
+            # CRITICAL: Ensure deter is 2D before calling _posterior
+            # This handles edge cases where operations might reduce dimensions
+            if deter.ndim == 1:
+                deter = deter.unsqueeze(0)  # (deter_dim,) -> (1, deter_dim)
+            assert deter.ndim == 2, f"deter must be 2D, got shape {deter.shape}"
+            
+            # Ensure token_t is also 2D
+            if token_t.ndim == 1:
+                token_t = token_t.unsqueeze(0)  # (token_dim,) -> (1, token_dim)
+            assert token_t.ndim == 2, f"token_t must be 2D, got shape {token_t.shape}"
             
             # Compute posterior distribution
             logits = self._posterior(deter, token_t)
@@ -328,6 +380,11 @@ class RSSM(nn.Module):
         :param action: Action (B, action_dim) or (B, 1) for discrete
         :return: New deterministic state (B, deter_dim)
         """
+        # Ensure inputs are 2D+ with batch dimension
+        assert deter.ndim >= 2, f"deter must be at least 2D, got shape {deter.shape}"
+        assert stoch.ndim >= 2, f"stoch must be at least 2D, got shape {stoch.shape}"
+        assert action.ndim >= 2, f"action must be at least 2D, got shape {action.shape}"
+        
         # Flatten stochastic state
         stoch_flat = stoch.reshape(stoch.shape[0], -1)
         
@@ -355,7 +412,23 @@ class RSSM(nn.Module):
         # The GRU expects (seq_len, batch, input) and returns (seq_len, batch, hidden)
         output_seq, new_deter_h = self.gru(gru_input_seq, deter.unsqueeze(0))
         
-        return new_deter_h.squeeze(0)
+        # Remove sequence dimension but keep batch dimension
+        # new_deter_h has shape (1, B, deter_dim) or (num_layers, B, deter_dim)
+        # We want (B, deter_dim)
+        if new_deter_h.ndim == 3:
+            result = new_deter_h[0]  # (B, deter_dim)
+        elif new_deter_h.ndim == 2:
+            result = new_deter_h  # Already (B, deter_dim)
+        else:
+            raise ValueError(f"Unexpected GRU output shape: {new_deter_h.shape}")
+        
+        # If still wrong (B=1 edge case), force it to be 2D
+        if result.ndim == 1:
+            result = result.unsqueeze(0)  # (deter_dim,) -> (1, deter_dim)
+        
+        # Ensure result is 2D
+        assert result.ndim == 2, f"_core must return 2D tensor, got shape {result.shape}"
+        return result
     
     def _posterior(self, deter: th.Tensor, tokens: th.Tensor) -> th.Tensor:
         """
@@ -483,11 +556,30 @@ class RSSM(nn.Module):
         """
         Concatenate deterministic and stochastic states to form feature vector.
         
-        :param deter: Deterministic state (B, deter_dim)
-        :param stoch: Stochastic state (B, stoch_dim, num_classes)
-        :return: Feature vector (B, deter_dim + stoch_size)
+        :param deter: Deterministic state (B, deter_dim) or (B, T, deter_dim)
+        :param stoch: Stochastic state (B, stoch_dim, num_classes) or (B, T, stoch_dim, num_classes)
+        :return: Feature vector (B, deter_dim + stoch_size) or (B, T, deter_dim + stoch_size)
         """
-        stoch_flat = stoch.reshape(stoch.shape[0], -1)
+        # Handle both 2D and 3D inputs (with or without time dimension)
+        if deter.ndim == 3 and stoch.ndim == 4:
+            # Has time dimension: (B, T, ...)
+            B, T = deter.shape[:2]
+            # Verify dimensions
+            if deter.shape[2] != self.deter_dim:
+                raise ValueError(f"deter last dim should be {self.deter_dim}, got {deter.shape}")
+            if stoch.shape[2] != self.stoch_dim or stoch.shape[3] != self.num_classes:
+                raise ValueError(f"stoch dims should be [{self.stoch_dim}, {self.num_classes}], got {stoch.shape}")
+            stoch_flat = stoch.reshape(B, T, -1)
+        elif deter.ndim == 2 and stoch.ndim == 3:
+            # No time dimension: (B, ...)
+            if deter.shape[1] != self.deter_dim:
+                raise ValueError(f"deter last dim should be {self.deter_dim}, got {deter.shape}")
+            if stoch.shape[1] != self.stoch_dim or stoch.shape[2] != self.num_classes:
+                raise ValueError(f"stoch dims should be [{self.stoch_dim}, {self.num_classes}], got {stoch.shape}")
+            stoch_flat = stoch.reshape(stoch.shape[0], -1)
+        else:
+            raise ValueError(f"Incompatible shapes: deter {deter.shape}, stoch {stoch.shape}")
+        
         return th.cat([deter, stoch_flat], dim=-1)
     
     def get_dist(self, logits: th.Tensor) -> th.distributions.Categorical:

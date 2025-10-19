@@ -15,6 +15,7 @@ from sb3_contrib.common.dreamerv3.policies import (
     DreamerV3ActorCriticPolicy,
 )
 from sb3_contrib.common.dreamerv3.rssm import RSSM
+from sb3_contrib.common.dreamerv3.sequence_buffer import SequenceReplayBuffer, SequenceReplayBufferSamples
 from sb3_contrib.common.dreamerv3.utils import (
     compute_actor_loss,
     compute_advantages,
@@ -36,6 +37,8 @@ __all__ = [
     "RunningNormalizer",
     "ValueNormalizer",
     "SlowValueNetwork",
+    "SequenceReplayBuffer",
+    "SequenceReplayBufferSamples",
     "lambda_return",
     "compute_advantages",
     "compute_actor_loss",

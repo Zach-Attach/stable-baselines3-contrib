@@ -18,6 +18,9 @@ class Encoder(nn.Module):
     """
     Encoder network that converts observations to latent tokens.
     
+    This is part of the world model in DreamerV3, not the policy.
+    The encoder processes raw observations into tokens that are fed to the RSSM.
+    
     Supports:
     - Vector observations: MLP encoder
     - Image observations: CNN encoder
@@ -40,7 +43,6 @@ class Encoder(nn.Module):
     ):
         super().__init__()
         
-        self.observation_space = observation_space
         self.hidden_dim = hidden_dim
         self.num_layers = num_layers
         self.activation = activation
@@ -166,6 +168,36 @@ class Encoder(nn.Module):
         
         return tokens
     
+    def entry_space(self) -> Dict[str, Tuple]:
+        """
+        Return the space specification for Encoder entries (for replay context).
+        
+        Encoders don't have hidden state, so this returns an empty dict.
+        
+        :return: Empty dict
+        """
+        return {}
+    
+    def initial(self, batch_size: int, device: th.device) -> Dict[str, th.Tensor]:
+        """
+        Initialize Encoder state (empty for stateless encoder).
+        
+        :param batch_size: Batch size
+        :param device: Device to create tensors on
+        :return: Empty dict
+        """
+        return {}
+    
+    def truncate(self, entries: Dict[str, th.Tensor], carry: Optional[Dict[str, th.Tensor]] = None) -> Dict[str, th.Tensor]:
+        """
+        Truncate entries to get carry state (empty for stateless encoder).
+        
+        :param entries: Entry dict (empty for encoder)
+        :param carry: Optional current carry (unused)
+        :return: Empty dict
+        """
+        return {}
+    
     @staticmethod
     def symlog(x: th.Tensor) -> th.Tensor:
         """
@@ -203,24 +235,33 @@ class Decoder(nn.Module):
         self.num_layers = num_layers
         self.activation = activation
         
+        # Debug: Log decoder initialization
+        print(f"DEBUG: Initializing Decoder with feature_dim={feature_dim}, observation_space={observation_space}")
+        
         # Determine observation type and build appropriate decoder
         if isinstance(observation_space, spaces.Box):
             if len(observation_space.shape) == 1:
                 # Vector observation
                 self.obs_type = 'vector'
+                print(f"DEBUG: Building MLP decoder for vector observation, output_dim={observation_space.shape[0]}")
                 self.decoder = self._build_mlp_decoder(observation_space.shape[0])
             elif len(observation_space.shape) == 3:
                 # Image observation
                 self.obs_type = 'image'
+                print(f"DEBUG: Building CNN decoder for image observation, output_shape={observation_space.shape}")
                 self.decoder = self._build_cnn_decoder(observation_space.shape)
             else:
                 raise NotImplementedError(f"Observation shape {observation_space.shape} not supported")
         elif isinstance(observation_space, spaces.Dict):
             # Dictionary observation space
             self.obs_type = 'dict'
+            print(f"DEBUG: Building Dict decoder with keys: {observation_space.spaces.keys()}")
             self.decoder = self._build_dict_decoder(observation_space)
         else:
             raise NotImplementedError(f"Observation space {observation_space} not supported")
+        
+        # Verify decoder was built correctly
+        self._verify_decoder_structure()
     
     def _build_mlp_decoder(self, output_dim: int) -> nn.Module:
         """Build MLP decoder for vector observations."""
@@ -256,6 +297,20 @@ class Decoder(nn.Module):
         start_width = width // (2 ** len(depths))
         start_features = depths[0] * start_height * start_width
         
+        # Debug: Check for invalid configuration
+        if start_features == 0:
+            raise ValueError(
+                f"CNN decoder error: start_features=0! "
+                f"Image too small: {output_shape}. "
+                f"Minimum image size is 16x16 for 4 conv layers with stride 2. "
+                f"start_height={start_height}, start_width={start_width}"
+            )
+        
+        # Debug: Log decoder configuration
+        print(f"DEBUG: Building CNN decoder - output_shape={output_shape}, "
+              f"start_features={start_features} (expected 4096 for 64x64 image), "
+              f"feature_dim={self.feature_dim}")
+        
         layers = [
             nn.Linear(self.feature_dim, start_features),
             nn.Unflatten(1, (depths[0], start_height, start_width)),
@@ -288,6 +343,32 @@ class Decoder(nn.Module):
         
         return decoders
     
+    def _verify_decoder_structure(self):
+        """Verify that the decoder was built with correct dimensions."""
+        if self.obs_type == 'image' and isinstance(self.decoder, nn.Sequential):
+            # Check first Linear layer
+            first_layer = self.decoder[0]
+            if isinstance(first_layer, nn.Linear):
+                in_features = first_layer.in_features
+                out_features = first_layer.out_features
+                print(f"DEBUG: CNN decoder first Linear layer: in_features={in_features}, out_features={out_features}")
+                if in_features != self.feature_dim:
+                    raise ValueError(
+                        f"Decoder Linear layer input mismatch! "
+                        f"Expected in_features={self.feature_dim}, got {in_features}. "
+                        f"This suggests the decoder was created or loaded with wrong feature_dim."
+                    )
+                # Calculate expected output features
+                channels, height, width = self.observation_space.shape
+                depths = [256, 256, 192, 128]
+                expected_out = depths[0] * (height // 16) * (width // 16)
+                if out_features != expected_out:
+                    raise ValueError(
+                        f"Decoder Linear layer output mismatch! "
+                        f"Expected out_features={expected_out} for image size {self.observation_space.shape}, "
+                        f"got {out_features}. start_height={height//16}, start_width={width//16}"
+                    )
+    
     def forward(self, features: th.Tensor) -> th.Tensor:
         """
         Decode features to reconstructed observations.
@@ -295,6 +376,14 @@ class Decoder(nn.Module):
         :param features: Latent features (B, feature_dim)
         :return: Reconstructed observations or dict of reconstructions
         """
+        # Validate input features shape
+        if features.shape[-1] != self.feature_dim:
+            raise ValueError(
+                f"Decoder received features with wrong dimension! "
+                f"Expected last dim={self.feature_dim}, got shape={features.shape}. "
+                f"obs_type={self.obs_type}, observation_space={self.observation_space}"
+            )
+        
         if self.obs_type in ['vector', 'image']:
             recon = self.decoder(features)
             
@@ -356,3 +445,33 @@ class Decoder(nn.Module):
             raise NotImplementedError(f"Observation type {self.obs_type} not supported")
         
         return loss
+    
+    def entry_space(self) -> Dict[str, Tuple]:
+        """
+        Return the space specification for Decoder entries (for replay context).
+        
+        Decoders don't have hidden state, so this returns an empty dict.
+        
+        :return: Empty dict
+        """
+        return {}
+    
+    def initial(self, batch_size: int, device: th.device) -> Dict[str, th.Tensor]:
+        """
+        Initialize Decoder state (empty for stateless decoder).
+        
+        :param batch_size: Batch size
+        :param device: Device to create tensors on
+        :return: Empty dict
+        """
+        return {}
+    
+    def truncate(self, entries: Dict[str, th.Tensor], carry: Optional[Dict[str, th.Tensor]] = None) -> Dict[str, th.Tensor]:
+        """
+        Truncate entries to get carry state (empty for stateless decoder).
+        
+        :param entries: Entry dict (empty for decoder)
+        :param carry: Optional current carry (unused)
+        :return: Empty dict
+        """
+        return {}

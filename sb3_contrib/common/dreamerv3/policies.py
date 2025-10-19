@@ -223,6 +223,8 @@ class DreamerV3ActorCriticPolicy(ActorCriticPolicy):
         unimix: float = 0.01,
         value_bins: int = 255,
         reward_bins: int = 255,
+        encoder_hidden_dim: int = 1024,
+        encoder_num_layers: int = 3,
     ):
         # Set default architectures
         if actor_net_arch is None:
@@ -245,9 +247,29 @@ class DreamerV3ActorCriticPolicy(ActorCriticPolicy):
         self.unimix = unimix
         self.value_bins = value_bins
         self.reward_bins = reward_bins
+        self.encoder_hidden_dim = encoder_hidden_dim
+        self.encoder_num_layers = encoder_num_layers
+
+        # In DreamerV3, the policy operates on RSSM features, not raw observations
+        # The Encoder is part of the world model, not the policy
+        # We use FlattenExtractor as a simple pass-through for RSSM features
+        # The actual observation encoding happens in the DreamerV3 algorithm via Encoder → RSSM
+        
+        # IMPORTANT: We do NOT override observation_space here.
+        # The policy will be built with the original observation_space dimensions,
+        # but during training, it will receive RSSM features instead of raw observations.
+        # During rollouts, the DreamerV3 algorithm handles:
+        # 1. Encode observations → tokens via Encoder
+        # 2. Process tokens → RSSM features via RSSM.observe
+        # 3. Pass RSSM features to world_model_actor_net (NOT this policy)
+        
+        # Use FlattenExtractor which will just pass through RSSM features during training
+        features_extractor_class = FlattenExtractor
+        if features_extractor_kwargs is None:
+            features_extractor_kwargs = {}
 
         super().__init__(
-            observation_space,
+            observation_space,  # Original observation_space (NOT overridden)
             action_space,
             lr_schedule,
             net_arch,
@@ -259,7 +281,7 @@ class DreamerV3ActorCriticPolicy(ActorCriticPolicy):
             use_expln,
             squash_output,
             features_extractor_class,
-            features_extractor_kwargs,
+            None, # features_extractor_kwargs
             share_features_extractor,
             normalize_images,
             optimizer_class,
@@ -442,42 +464,43 @@ class DreamerV3ActorCriticPolicy(ActorCriticPolicy):
         deterministic: bool = False,
     ) -> tuple[np.ndarray, Optional[tuple[np.ndarray, ...]]]:
         """
-        Get the policy action from an observation (and optional hidden state).
+        IMPORTANT: This method should NOT be called for DreamerV3!
         
-        Overrides the base class to properly unscale actions for continuous action spaces.
-        DreamerV3 uses tanh-bounded actions (range [-1, 1]) that need to be unscaled
-        to the actual action space bounds.
-
-        :param observation: the input observation
-        :param state: The last hidden states (can be None, used in recurrent policies)
-        :param episode_start: The last masks (can be None, used in recurrent policies)
-        :param deterministic: Whether or not to return deterministic actions.
-        :return: the model's action and the next hidden state
+        In DreamerV3, inference must go through the world model:
+          observation → Encoder → RSSM → features → policy
+        
+        Direct policy.predict(observation) bypasses the world model entirely,
+        which defeats the purpose of DreamerV3.
+        
+        Instead, use DreamerV3.predict() which properly processes observations
+        through the encoder and RSSM before calling the policy.
+        
+        :param observation: Observation (should be RSSM features, not raw observations)
+        :param state: RNN state (not used)
+        :param episode_start: Episode start flags (not used)
+        :param deterministic: Whether to use deterministic actions
+        :return: Actions and next state
         """
-        # Switch to eval mode
-        self.set_training_mode(False)
-
-        # Convert observation to tensor
-        obs_tensor, vectorized_env = self.obs_to_tensor(observation)
-
-        with th.no_grad():
-            actions = self._predict(obs_tensor, deterministic=deterministic)
+        # This should only be called with RSSM features (from training), not raw observations
+        # If this is being called during rollouts, something is wrong!
         
-        # Convert to numpy and reshape
-        actions = actions.cpu().numpy().reshape((-1, *self.action_space.shape))
-
-        # For continuous action spaces, unscale from [-1, 1] to action space bounds
-        # DreamerV3's BoundedDiagGaussianDistribution uses tanh, so actions are in [-1, 1]
-        if isinstance(self.action_space, spaces.Box):
-            # Unscale from [-1, 1] to [low, high]
-            actions = self.unscale_action(actions)
-
-        # Remove batch dimension if needed
-        if not vectorized_env:
-            assert isinstance(actions, np.ndarray)
-            actions = actions.squeeze(axis=0)
-
-        return actions, state
+        # For backward compatibility during training when RSSM features are passed,
+        # we allow this to work, but add a warning if the input looks like raw observations
+        import warnings
+        if isinstance(observation, np.ndarray):
+            # Check if this looks like raw observations (e.g., images or high-dim vectors)
+            # RSSM features should be (N, 5120) typically
+            if observation.ndim > 2 or (observation.ndim == 2 and observation.shape[1] > 6000):
+                warnings.warn(
+                    "DreamerV3ActorCriticPolicy.predict() called with what appears to be "
+                    "raw observations instead of RSSM features. This will not work correctly. "
+                    "Use DreamerV3.predict() instead, which processes through the world model.",
+                    UserWarning,
+                    stacklevel=2
+                )
+        
+        # Call parent predict (for RSSM features only)
+        return super().predict(observation, state, episode_start, deterministic)
 
     def predict_values(self, obs: th.Tensor) -> th.Tensor:
         """
@@ -522,9 +545,17 @@ class DreamerV3ActorCriticPolicy(ActorCriticPolicy):
 
 class DreamerV3CnnPolicy(DreamerV3ActorCriticPolicy):
     """
-    DreamerV3 policy with CNN feature extractor.
+    DreamerV3 policy for image observations.
+    
+    Note: In DreamerV3, CNN encoding happens in the world model's Encoder,
+    not in the policy's features_extractor. The policy operates on RSSM features
+    (latent state), so this class uses the same FlattenExtractor as the parent.
+    
+    The actual CNN architecture from original DreamerV3 (4 conv layers with depths
+    [128, 192, 256, 256], kernel_size=5, stride=2) is implemented in the world
+    model's Encoder component, which is created by the DreamerV3 algorithm.
 
-    :param observation_space: Observation space
+    :param observation_space: Observation space (should be an image space)
     :param action_space: Action space
     :param lr_schedule: Learning rate schedule
     :param net_arch: Network architecture specification
@@ -538,18 +569,16 @@ class DreamerV3CnnPolicy(DreamerV3ActorCriticPolicy):
         lr_schedule: Schedule,
         net_arch: Optional[Union[list[int], dict[str, list[int]]]] = None,
         activation_fn: type[nn.Module] = nn.SiLU,
-        features_extractor_class: type[BaseFeaturesExtractor] = NatureCNN,
-        features_extractor_kwargs: Optional[dict[str, Any]] = None,
         **kwargs: Any,
     ):
+        # Do NOT override features_extractor_class - use parent's FlattenExtractor
+        # The CNN encoding is handled by the world model's Encoder, not the policy
         super().__init__(
             observation_space,
             action_space,
             lr_schedule,
             net_arch,
             activation_fn,
-            features_extractor_class,
-            features_extractor_kwargs,
             **kwargs,
         )
 
